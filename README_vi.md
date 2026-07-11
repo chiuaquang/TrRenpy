@@ -70,10 +70,10 @@ Dự án này được cấp phép theo Giấy phép MIT — xem file [LICENSE](
 
 ## 👥 Thông Tin Nhà Phát Triển
 
-- **Nhà phát triển**: 九月 (Jiuyue)
+- **Nhà phát triển**: 九月 (Jiuyue) Sửa lại bởi DexBill
 - **Telegram**: [@dexbillava](https://t.me/dexbillava)
 - **Nhà cung cấp API dịch thuật**: Tencent Cloud Translation
-- **Báo lỗi**: [GitHub Issues](https://github.com/dkss123)
+- **Báo lỗi**: [GitHub Issues](https://github.com/chiuaquang)
 
 ## 🌟 Ủng Hộ Dự Án
 
