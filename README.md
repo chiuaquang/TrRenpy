@@ -73,7 +73,7 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 - **Developer**: 九月 (Jiuyue) Edited by DexBill
 - **Telegram**: [@dexbillava](https://t.me/dexbillava)
 - **Translation API Provider**: Tencent Cloud Translation
-- **Issue Tracker**: [GitHub Issues](https://github.com/dkss123)
+- **Issue Tracker**: [GitHub Issues](https://github.com/chiuaquang)
 
 ## 🌟 Support
 
