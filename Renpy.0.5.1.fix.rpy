@@ -4,11 +4,10 @@ init python:
     import threading, socketserver, http.server
     import traceback, marshal
     from datetime import datetime
+    from collections import OrderedDict
 
     # === Cấu hình ===
-    # Google Translate miễn phí — không cần API key
     TARGET_LANG = "vi"          # "vi"=Tiếng Việt | "zh"=Trung | "ja"=Nhật | "ko"=Hàn
-    # Dùng đường dẫn tuyệt đối từ gamedir — tránh lạc file trên Android
     _GAMEDIR    = renpy.config.gamedir
     CACHE_FILE  = os.path.join(_GAMEDIR, "translation_cache.json")
     SCRIPTS_DIR = os.path.join(_GAMEDIR, "scripts")
@@ -22,124 +21,170 @@ init python:
     except OSError:
         pass
 
-    _cache = {}           # {md5: translated}
-    _cache_raw = {}       # {md5: original}  — để lưu text gốc vào JSON
+    # ── Cache & lock ──────────────────────────────────────────────────────────
+    _cache      = {}   # {md5: translated_str}
+    _cache_raw  = {}   # {md5: original_str}
+    _cache_lock = threading.Lock()
+    _inflight   = {}   # {md5: threading.Event}
+    _dirty      = [False]
+
+    # Load cache 1 lần lúc khởi động
     if os.path.exists(CACHE_FILE):
         try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                for item in data:
-                    v = item.get(TARGET_LANG, item.get('zh', ''))
-                    if v:  # bỏ qua entry rỗng để dịch lại
-                        _cache[item['id']]     = v
-                        _cache_raw[item['id']] = item.get('en', '')
+            with open(CACHE_FILE, 'r', encoding='utf-8') as _f:
+                for _it in json.load(_f):
+                    _v = _it.get(TARGET_LANG, _it.get('zh', ''))
+                    if _v:
+                        _cache[_it['id']]     = _v
+                        _cache_raw[_it['id']] = _it.get('en', '')
         except:
             pass
 
-    def _save_cache():
-        data = [
-            {"id": k, "en": _cache_raw.get(k, ""), TARGET_LANG: v}
-            for k, v in _cache.items()
-        ]
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+    # ── Ghi cache gộp mỗi 10 giây (thread nền) ───────────────────────────────
+    def _cache_writer():
+        while True:
+            time.sleep(10)
+            if not _dirty[0]:
+                continue
+            _dirty[0] = False
+            try:
+                with _cache_lock:
+                    snap = list(_cache.items())
+                rows = [OrderedDict([("id", k), ("en", _cache_raw.get(k, "")), (TARGET_LANG, v)])
+                        for k, v in snap]
+                tmp = CACHE_FILE + ".tmp"
+                with open(tmp, 'w', encoding='utf-8') as _f:
+                    json.dump(rows, _f, ensure_ascii=False, indent=2)
+                os.rename(tmp, CACHE_FILE)
+            except:
+                pass
+
+    _wr = threading.Thread(target=_cache_writer)
+    _wr.daemon = True
+    _wr.start()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    _viet_chars = frozenset(
+        u'àáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹỵ'
+        u'ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỶỸỴ'
+    )
 
     def _should_translate(text):
-        if not isinstance(text, str):
-            return False
-        text = text.strip()
-        if len(text) < 2:
-            return False
-        # Bỏ qua nếu toàn ký tự đặc biệt/số
-        if not any(c.isalpha() for c in text):
-            return False
-        # Bỏ qua nếu đã là tiếng Việt (có dấu đặc trưng)
-        viet = set('àáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹỵ'
-                   'ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỶỸỴ')
-        if any(c in viet for c in text):
-            return False
-        # Bỏ qua nếu đã là tiếng Trung/Nhật/Hàn
-        if any('\u4e00' <= c <= '\u9fff' for c in text):
-            return False
+        if not isinstance(text, str): return False
+        t = text.strip()
+        if len(t) < 2: return False
+        if not any(c.isalpha() for c in t): return False
+        if any(c in _viet_chars for c in t): return False
+        if any(u'\u4e00' <= c <= u'\u9fff' for c in t): return False
         return True
 
-    def _call_tencent(text):
-        # Đã thay bằng Google Translate miễn phí
+    def _api_call(text):
+        """Gọi Google Translate — chỉ dùng trong thread nền."""
         try:
-            url = "https://translate.googleapis.com/translate_a/single"
-            params = {
-                'client': 'gtx',
-                'sl':     'auto',
-                'tl':     TARGET_LANG,
-                'dt':     't',
-                'q':      text
-            }
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                              'AppleWebKit/537.36 (KHTML, like Gecko) '
-                              'Chrome/120.0.0.0 Safari/537.36'
-            }
-            r = requests.get(url, params=params, headers=headers, timeout=8)
+            r = requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={'client':'gtx','sl':'auto','tl':TARGET_LANG,'dt':'t','q':text},
+                headers={'User-Agent':'Mozilla/5.0'},
+                timeout=6
+            )
             if r.status_code == 200:
-                data = r.json()
-                translated = ''.join(
-                    item[0] for item in data[0] if item and item[0]
-                )
-                return translated.strip() if translated else None
+                out = ''.join(x[0] for x in r.json()[0] if x and x[0])
+                return out.strip() or None
         except:
             pass
         return None
 
+    def _store(key, orig, trans):
+        with _cache_lock:
+            _cache[key]     = trans
+            _cache_raw[key] = orig
+        _dirty[0] = True
+
+    def _get_key(text):
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+    def _escape_renpy(s):
+        """Escape ký tự đặc biệt Ren'Py, giữ nguyên tag [...] và {...}."""
+        out = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            matched = False
+            for op, cl in [('[',']'),('{','}')]:
+                if c == op:
+                    end = s.find(cl, i+1)
+                    if end != -1:
+                        out.append(s[i:end+1])
+                        i = end + 1
+                        matched = True
+                        break
+            if matched: continue
+            out.append(c*2 if c in '{}[]%' else c)
+            i += 1
+        return ''.join(out)
+
+    # ── Dịch nền — KHÔNG BAO GIỜ block game thread ───────────────────────────
+    def _bg_translate(text):
+        """Dịch text trên thread nền; trả về ngay lập tức."""
+        if not _should_translate(text):
+            return
+        key = _get_key(text)
+        with _cache_lock:
+            done = key in _cache
+        if done or key in _inflight:
+            return
+        ev = threading.Event()
+        _inflight[key] = ev
+        def _run():
+            try:
+                trans = _api_call(text)
+                if trans:
+                    _store(key, text, trans)
+            finally:
+                ev.set()
+                _inflight.pop(key, None)
+        t = threading.Thread(target=_run)
+        t.daemon = True
+        t.start()
+
+    # ── translate_text: gọi API đồng bộ — hiện bản dịch NGAY LẬP TỨC ─────────
+    # Logic: cache hit  → trả bản dịch ngay (không gọi API).
+    #        cache miss → gọi API ngay trên game thread → hiện bản dịch ngay.
+    #        Kết quả được lưu cache để lần sau không cần gọi API nữa.
     def translate_text(text):
         if not isinstance(text, str) or not _should_translate(text):
             return text
-        # Chỉ bảo vệ tag Ren'Py [...] và {...}, KHÔNG bảo vệ "..." hay '...'
         parts = re.split(r'(\[[^\]]*\]|\{[^}]*\})', text)
         result = []
         for part in parts:
+            if not part: continue
             if re.match(r'(?:\[.*\]|\{.*\})$', part):
                 result.append(part)
             else:
-                key = hashlib.md5(part.encode()).hexdigest()
-                cached = _cache.get(key, '')
-                if cached:  # chỉ dùng cache nếu không rỗng
-                    result.append(cached)
+                if not _should_translate(part):
+                    result.append(part)
+                    continue
+                key = _get_key(part)
+                with _cache_lock:
+                    hit = _cache.get(key)
+                if hit:
+                    result.append(hit)
                 else:
-                    trans = _call_tencent(part)
-                    if trans:  # bỏ điều kiện trans != part để dịch kể cả khi giống gốc
-                        _cache[key]     = trans
-                        _cache_raw[key] = part
-                        _save_cache()
+                    # Gọi API đồng bộ ngay để hiện bản dịch ngay lập tức
+                    trans = _api_call(part)
+                    if trans:
+                        _store(key, part, trans)
                         result.append(trans)
                     else:
-                        result.append(part)
-        final = ''.join(result)
-        escaped = ""
-        i = 0
-        while i < len(final):
-            c = final[i]
-            in_mark = False
-            # Chỉ skip tag [...] và {...}, không skip nháy đơn/đôi
-            for s, e in [('[', ']'), ('{', '}')]:
-                if c == s:
-                    end = final.find(e, i+1)
-                    if end != -1:
-                        escaped += final[i:end+1]
-                        i = end + 1
-                        in_mark = True
-                        break
-            if in_mark:
-                continue
-            escaped += c * 2 if c in '{}[]%' else c
-            i += 1
-        return escaped
+                        result.append(part)  # fallback nếu API lỗi / mất mạng
+        joined = ''.join(result)
+        return _escape_renpy(joined)
 
     def _translate_menu_items(items):
         new_items = []
         for item in items:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
-                label = item[0]
-                rest  = item[1:]
+                label, rest = item[0], item[1:]
                 if isinstance(label, str):
                     label = translate_text(label)
                 new_items.append((label,) + tuple(rest))
@@ -155,7 +200,7 @@ init python:
             return renpy._original_say(who, what, *args, **kwargs)
         renpy.say = _hooked_say
 
-    # Hook menu — thử tất cả các cách, luôn set lại mỗi lần init
+    # Hook menu
 
     # Cách 1: renpy.exports.menu — hoạt động trên JoiPlay
     try:
@@ -516,7 +561,6 @@ init python:
             display: block;
         }
 
-        /* 自定义复选框 */
         .custom-checkbox {
             display: inline-block;
             width: 20px;
@@ -704,7 +748,7 @@ init python:
 <body>
     <div class="container">
         <div class="header">
-            <div class="ios-badge">版本V0.2</div>
+            <div class="ios-badge">版本V0.5.1</div>
             <h1 style="margin: 0; font-size: 32px;">面板</h1>
             <p style="color: var(--text-secondary); margin-top: 8px;">BY 我灵机不动</p>
             <div class="system-info" id="systemInfo"></div>
@@ -799,7 +843,6 @@ init python:
             if (index === 2) loadSystemInfo();
         }
 
-        // ========== 工具函数 ==========
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
@@ -820,7 +863,6 @@ init python:
             if (el) el.textContent = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
         }
 
-        // ========== 变量提取 ==========
         async function extractVariables() {
             updateStatus('正在提取变量...', 'info');
             try {
@@ -927,7 +969,6 @@ init python:
             switchTab(1);
         }
 
-        // ========== 脚本执行 ==========
         async function executeScript() {
             const script = document.getElementById('scriptOutput').value.trim();
             if (!script) { alert('请输入脚本'); return; }
@@ -972,7 +1013,6 @@ init python:
             } catch (e) { console.error(e); }
         }
 
-        // ========== 脚本库 ==========
         async function loadScriptLibrary() {
             try {
                 const res = await fetch('/api/scripts');
@@ -1006,7 +1046,6 @@ init python:
             }
         }
 
-        // ========== DUMP & 远程 ==========
         async function dumpScripts() {
             const path = document.getElementById('dumpPath').value.trim();
             if (!path) { alert('请输入目录名'); return; }
