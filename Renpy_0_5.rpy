@@ -6,77 +6,41 @@ init python:
     from datetime import datetime
 
     # === Cấu hình ===
+    # Google Translate miễn phí — không cần API key
     TARGET_LANG = "vi"          # "vi"=Tiếng Việt | "zh"=Trung | "ja"=Nhật | "ko"=Hàn
+    # Dùng đường dẫn tuyệt đối từ gamedir — tránh lạc file trên Android
     _GAMEDIR    = renpy.config.gamedir
     CACHE_FILE  = os.path.join(_GAMEDIR, "translation_cache.json")
     SCRIPTS_DIR = os.path.join(_GAMEDIR, "scripts")
     DUMP_DIR    = os.path.join(_GAMEDIR, "dumps")
-    os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    os.makedirs(DUMP_DIR, exist_ok=True)
-
-    # Thời gian chờ tối đa cho 1 request dịch (giây) – giảm để phản hồi nhanh
-    TRANSLATE_TIMEOUT = 2
+    try:
+        os.makedirs(SCRIPTS_DIR)
+    except OSError:
+        pass
+    try:
+        os.makedirs(DUMP_DIR)
+    except OSError:
+        pass
 
     _cache = {}           # {md5: translated}
-    _cache_raw = {}       # {md5: original}
-    _script_hash = ""     # hash của toàn bộ script .rpy
-    _cache_valid = False  # True nếu cache khớp với script hiện tại
-
-    # Session dùng chung – tái sử dụng kết nối TCP để tăng tốc
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                      'AppleWebKit/537.36 (KHTML, like Gecko) '
-                      'Chrome/120.0.0.0 Safari/537.36'
-    })
-
-    # ================== Tính hash của tất cả file .rpy ==================
-    def _compute_script_hash():
-        """Trả về MD5 tổng hợp của tất cả file .rpy trong game/"""
-        hasher = hashlib.md5()
-        try:
-            for root, dirs, files in os.walk(_GAMEDIR):
-                for fn in sorted(files):
-                    if fn.endswith(".rpy"):
-                        path = os.path.join(root, fn)
-                        with open(path, 'rb') as f:
-                            hasher.update(f.read())
-        except:
-            pass
-        return hasher.hexdigest()
-
-    # Tải cache từ file (nếu có)
+    _cache_raw = {}       # {md5: original}  — để lưu text gốc vào JSON
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 for item in data:
                     v = item.get(TARGET_LANG, item.get('zh', ''))
-                    if v:
+                    if v:  # bỏ qua entry rỗng để dịch lại
                         _cache[item['id']]     = v
                         _cache_raw[item['id']] = item.get('en', '')
-            # Đọc script_hash cũ nếu có
-            if data and isinstance(data, list) and len(data) > 0 and 'script_hash' in data[0]:
-                _script_hash = data[0]['script_hash']
         except:
             pass
 
-    # Kiểm tra cache có còn hợp lệ với script hiện tại không
-    current_hash = _compute_script_hash()
-    _cache_valid = (_script_hash == current_hash and len(_cache) > 0)
-
-    # Cờ để khi preload không ghi cache liên tục (tiết kiệm I/O)
-    _bulk_preload = False
-
-    def _save_cache(include_hash=False):
-        """Lưu cache ra file JSON, có thể kèm script_hash"""
+    def _save_cache():
         data = [
             {"id": k, "en": _cache_raw.get(k, ""), TARGET_LANG: v}
             for k, v in _cache.items()
         ]
-        if include_hash and _script_hash:
-            # Thêm một entry đặc biệt để lưu script_hash (sẽ được bỏ qua khi tải)
-            data.insert(0, {"id": "__script_hash__", "en": "", TARGET_LANG: "", "script_hash": _script_hash})
         with open(CACHE_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -86,61 +50,66 @@ init python:
         text = text.strip()
         if len(text) < 2:
             return False
+        # Bỏ qua nếu toàn ký tự đặc biệt/số
         if not any(c.isalpha() for c in text):
             return False
+        # Bỏ qua nếu đã là tiếng Việt (có dấu đặc trưng)
         viet = set('àáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹỵ'
                    'ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỶỸỴ')
         if any(c in viet for c in text):
             return False
+        # Bỏ qua nếu đã là tiếng Trung/Nhật/Hàn
         if any('\u4e00' <= c <= '\u9fff' for c in text):
             return False
         return True
 
-    # ================== API Google Dịch nhanh (session, retry) ==================
-    def _call_google_translate(text):
-        """Gọi Google Translate (miễn phí) với tối ưu tốc độ"""
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {
-            'client': 'gtx',
-            'sl':     'auto',
-            'tl':     TARGET_LANG,
-            'dt':     't',
-            'q':      text
-        }
-        # Thử tối đa 2 lần nếu thất bại
-        for attempt in range(2):
-            try:
-                r = session.get(url, params=params, timeout=TRANSLATE_TIMEOUT)
-                if r.status_code == 200:
-                    data = r.json()
-                    translated = ''.join(
-                        item[0] for item in data[0] if item and item[0]
-                    )
-                    return translated.strip() if translated else None
-            except:
-                pass
+    def _call_tencent(text):
+        # Đã thay bằng Google Translate miễn phí
+        try:
+            url = "https://translate.googleapis.com/translate_a/single"
+            params = {
+                'client': 'gtx',
+                'sl':     'auto',
+                'tl':     TARGET_LANG,
+                'dt':     't',
+                'q':      text
+            }
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 (KHTML, like Gecko) '
+                              'Chrome/120.0.0.0 Safari/537.36'
+            }
+            r = requests.get(url, params=params, headers=headers, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                translated = ''.join(
+                    item[0] for item in data[0] if item and item[0]
+                )
+                return translated.strip() if translated else None
+        except:
+            pass
         return None
 
     def translate_text(text):
         if not isinstance(text, str) or not _should_translate(text):
             return text
+        # Chỉ bảo vệ tag Ren'Py [...] và {...}, KHÔNG bảo vệ "..." hay '...'
         parts = re.split(r'(\[[^\]]*\]|\{[^}]*\})', text)
         result = []
         for part in parts:
-            if re.fullmatch(r'\[.*\]|\{.*\}', part):
+            if re.match(r'(?:\[.*\]|\{.*\})$', part):
                 result.append(part)
             else:
                 key = hashlib.md5(part.encode()).hexdigest()
                 cached = _cache.get(key, '')
-                if cached:
+                if cached:  # chỉ dùng cache nếu không rỗng
                     result.append(cached)
                 else:
-                    trans = _call_google_translate(part)
-                    if trans:
+                    trans = _call_tencent(part)
+                    if trans:  # bỏ điều kiện trans != part để dịch kể cả khi giống gốc
                         _cache[key]     = trans
                         _cache_raw[key] = part
-                        if not _bulk_preload:
-                            _save_cache()
+                        _save_cache()
                         result.append(trans)
                     else:
                         result.append(part)
@@ -150,6 +119,7 @@ init python:
         while i < len(final):
             c = final[i]
             in_mark = False
+            # Chỉ skip tag [...] và {...}, không skip nháy đơn/đôi
             for s, e in [('[', ']'), ('{', '}')]:
                 if c == s:
                     end = final.find(e, i+1)
@@ -177,7 +147,6 @@ init python:
                 new_items.append(item)
         return new_items
 
-    # ===== Hook vào các hàm Ren'Py =====
     if not hasattr(renpy, '_original_say'):
         renpy._original_say = renpy.say
         def _hooked_say(who, what, *args, **kwargs):
@@ -186,6 +155,9 @@ init python:
             return renpy._original_say(who, what, *args, **kwargs)
         renpy.say = _hooked_say
 
+    # Hook menu — thử tất cả các cách, luôn set lại mỗi lần init
+
+    # Cách 1: renpy.exports.menu — hoạt động trên JoiPlay
     try:
         import renpy.exports as _rexports
         if not hasattr(_rexports, '_orig_menu'):
@@ -196,11 +168,13 @@ init python:
     except:
         pass
 
+    # Cách 2: config.menu_text_filter — Ren'Py 8.x
     try:
         renpy.config.menu_text_filter = translate_text
     except:
         pass
 
+    # Cách 3: renpy.display_menu — Ren'Py 7.x fallback
     try:
         if hasattr(renpy, 'display_menu'):
             if not hasattr(renpy, '_original_display_menu') or not callable(renpy._original_display_menu):
@@ -211,66 +185,28 @@ init python:
     except:
         pass
 
-    if not hasattr(renpy.text.text, '_original_Text_init'):
-        renpy.text.text._original_Text_init = renpy.text.text.Text.__init__
-        def _patched_Text_init(self, text, *args, **kwargs):
-            if isinstance(text, str):
-                text = translate_text(text)
-            return renpy.text.text._original_Text_init(self, text, *args, **kwargs)
-        renpy.text.text.Text.__init__ = _patched_Text_init
-
-    # ================== Pre‑dịch toàn bộ script (chỉ khi cần) ==================
-    def preload_all_texts():
-        global _bulk_preload, _script_hash
-        STRING_RE = re.compile(r'''(["'])((?:\\.|(?!\1).)*?)\1''')
-        texts_to_translate = set()
-
-        for root, dirs, files in os.walk(_GAMEDIR):
-            for fn in files:
-                if fn.endswith(".rpy"):
-                    path = os.path.join(root, fn)
-                    try:
-                        with open(path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        for match in STRING_RE.finditer(content):
-                            s = match.group(2)
-                            if s.strip() and _should_translate(s):
-                                texts_to_translate.add(s)
-                    except:
-                        continue
-
-        _bulk_preload = True
-        count = 0
-        for t in texts_to_translate:
-            try:
-                translate_text(t)
-                count += 1
-            except:
-                pass
-        _bulk_preload = False
-
-        # Cập nhật script_hash và lưu cache kèm hash
-        _script_hash = _compute_script_hash()
-        _save_cache(include_hash=True)
-        return count
-
-    # ================== Các công cụ debug ==================
+    # ==================== 脚本执行工具 ====================
     def lochttp(url):
+        """从URL加载并执行Python脚本"""
         try:
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 code = resp.text
                 exec(code, globals())
-                return {"status": "success", "message": f"Executed script from {url}"}
+                return {"status": "success", "message": "Executed script from " + str(url)}
             else:
-                return {"status": "error", "message": f"HTTP {resp.status_code}"}
+                return {"status": "error", "message": "HTTP " + str(resp.status_code)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
     def sdump(output_dir):
+        """Dump 所有运行时资源"""
         try:
             full_output = os.path.join(DUMP_DIR, output_dir)
-            os.makedirs(full_output, exist_ok=True)
+            try:
+                os.makedirs(full_output)
+            except OSError:
+                pass
 
             all_files = set()
             for fn in renpy.list_files():
@@ -283,7 +219,10 @@ init python:
 
             for filepath in sorted(all_files):
                 dest_path = os.path.join(full_output, filepath)
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                try:
+                    os.makedirs(os.path.dirname(dest_path))
+                except OSError:
+                    pass
 
                 try:
                     if filepath.endswith('.rpy'):
@@ -309,15 +248,16 @@ init python:
                                 dumped_count += 1
                                 continue
                         except Exception as e:
-                            errors.append(f"{filepath}: {e}")
+                            errors.append(str(filepath) + ": " + str(e))
                     
+                    # 其他文件（图片、音频等）
                     file_data = renpy.file(filepath).read()
                     with open(dest_path, 'wb') as out_f:
                         out_f.write(file_data)
                     dumped_count += 1
 
                 except Exception as e:
-                    errors.append(f"{filepath}: {e}")
+                    errors.append(str(filepath) + ": " + str(e))
 
             if errors:
                 with open(os.path.join(full_output, "DUMP_ERRORS.txt"), 'w', encoding='utf-8') as log:
@@ -326,7 +266,7 @@ init python:
 
             return {
                 "status": "success",
-                "message": f"成功提取 {dumped_count} 个文件到 {full_output}",
+                "message": "成功提取 " + str(dumped_count) + " 个文件到 " + str(full_output),
                 "errors": len(errors)
             }
 
@@ -337,6 +277,7 @@ init python:
             }
 
     def execute_script_content(code_str, filename="<dynamic>"):
+        """安全执行脚本内容"""
         try:
             compiled = compile(code_str, filename, 'exec')
             exec(compiled, globals())
@@ -345,7 +286,7 @@ init python:
             tb = traceback.format_exc()
             return {"status": "error", "message": str(e), "traceback": tb}
 
-    # ================== DebugMonitor (quản lý biến & script) ==================
+    # ==================== 监控器 ====================
     class DebugMonitor:
         def __init__(self):
             self.monitored = {}
@@ -431,7 +372,7 @@ init python:
                         "error": "参数无效"
                     })
             
-            script = "\n".join([f"{u.get('variable_name')} = {u.get('new_value')}" 
+            script = "\n".join([str(u.get('variable_name')) + " = " + str(u.get('new_value')) 
                                for u in updates if u.get('variable_name')])
             self.script_history.append({
                 "time": time.strftime("%H:%M:%S"),
@@ -449,7 +390,7 @@ init python:
 
     monitor = DebugMonitor()
 
-    # ==================== iOS 风格 HTML (đầy đủ) ====================
+    # ==================== iOS 风格 HTML ====================
     DEBUG_HTML = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -575,6 +516,7 @@ init python:
             display: block;
         }
 
+        /* 自定义复选框 */
         .custom-checkbox {
             display: inline-block;
             width: 20px;
@@ -857,6 +799,7 @@ init python:
             if (index === 2) loadSystemInfo();
         }
 
+        // ========== 工具函数 ==========
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
@@ -877,6 +820,7 @@ init python:
             if (el) el.textContent = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
         }
 
+        // ========== 变量提取 ==========
         async function extractVariables() {
             updateStatus('正在提取变量...', 'info');
             try {
@@ -983,6 +927,7 @@ init python:
             switchTab(1);
         }
 
+        // ========== 脚本执行 ==========
         async function executeScript() {
             const script = document.getElementById('scriptOutput').value.trim();
             if (!script) { alert('请输入脚本'); return; }
@@ -1027,6 +972,7 @@ init python:
             } catch (e) { console.error(e); }
         }
 
+        // ========== 脚本库 ==========
         async function loadScriptLibrary() {
             try {
                 const res = await fetch('/api/scripts');
@@ -1060,6 +1006,7 @@ init python:
             }
         }
 
+        // ========== DUMP & 远程 ==========
         async function dumpScripts() {
             const path = document.getElementById('dumpPath').value.trim();
             if (!path) { alert('请输入目录名'); return; }
@@ -1245,7 +1192,9 @@ init python:
         except:
             pass
 
-    threading.Thread(target=start_debug_server, daemon=True).start()
+    _t = threading.Thread(target=start_debug_server)
+    _t.daemon = True
+    _t.start()
 
 screen debug_status():
     zorder 999
@@ -1257,19 +1206,6 @@ screen debug_status():
             text "iOS 调试工具" size 14 color "#FFF"
             textbutton "打开面板" action OpenURL("http://127.0.0.1:8889") text_size 12
 
-default persistent._translation_preloaded = False
-
 label after_load:
-    if not persistent._translation_preloaded:
-        python:
-            if _cache_valid:
-                persistent._translation_preloaded = True
-            else:
-                try:
-                    count = preload_all_texts()
-                    persistent._translation_preloaded = True
-                    renpy.notify(f"Đã dịch sẵn {count} chuỗi")
-                except:
-                    pass
     show screen debug_status
     return
